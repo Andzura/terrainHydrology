@@ -10,8 +10,8 @@ import networkx as nx
 from scipy import interpolate
 import shapely.geometry as geom
 import numpy as np
-from shapely.geometry import asLineString
-from multiprocessing import Process, Pipe, Queue
+from shapely.geometry import LineString
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import trange
 import math
 import rasterio
@@ -387,7 +387,7 @@ for node in hydrology.allMouthNodes():
         for i in range(len(out[0])): # loops through each coordinate created in interpolation
             lstr.append((out[0][i],out[1][i],int(out[2][i])))
             dbg.append(int(out[2][i]))
-        line = asLineString(lstr)
+        line = LineString(lstr)
         
         for p in path: # for each node in the path to this particular leaf
             # I'm pretty sure this loop ensures that
@@ -588,47 +588,33 @@ def w(d): # This returns the "influence field" (section 7)
         return 1;
     return (max(0,(radius+1)-d)/(((radius)+1)*d))**2
 
-def subroutine(conn, q):
-    #print(f'Thread ID: {conn.recv()}')
-    threadID = conn.recv()
-    for i in range(threadID, outputResolution, numProcs):
-        arr = np.full(outputResolution, oceanFloor,dtype=np.single)
-        for j in range(outputResolution):
-            arr[j] = max(oceanFloor,TerrainFunction((j,i)))
-        try:
-            q.put((i,arr.tobytes()))
-        except:
-            conn.close()
-            exit()
-        #print(f'row {i} complete')
-    
-    #conn.send(len(shore))
-    conn.close()
 
-dataQueue = Queue()
-pipes = []
-processes = []
+
 outputCounter = 0
-for p in range(numProcs):
-    pipes.append(Pipe())
-    processes.append(Process(target=subroutine, args=(pipes[p][1],dataQueue)))
-    processes[p].start()
-    pipes[p][0].send(p)
-for i in trange(outputResolution):
-    data = dataQueue.get()
-    imgOut[data[0]] = np.frombuffer(data[1],dtype=np.single)
 
-    if outputCounter > 50:
-        plt.clf()
-        plt.imshow(imgOut, cmap=plt.get_cmap('terrain'))
-        plt.colorbar()
-        plt.tight_layout()                                # DEBUG
-        plt.savefig(outputDir + 'out-color.png')
-        outputCounter = 0
-    outputCounter += 1
-for p in range(numProcs):
-    processes[p].join()
-    pipes[p][0].close()
+def compute_row(i: int):
+    arr = np.full(outputResolution, oceanFloor, dtype=np.single)
+    for j in range(outputResolution):
+        arr[j] = max(oceanFloor, TerrainFunction((j, i)))
+    return (i, arr.tobytes())
+
+# Use a thread pool instead of multiprocessing processes on Windows to avoid
+# spawn/pickle/import issues. Threads share memory so heavy globals (shore,
+# Ts, cells, etc.) are available without pickling.
+with ThreadPoolExecutor(max_workers=numProcs) as executor:
+    futures = {executor.submit(compute_row, i): i for i in range(outputResolution)}
+    for fut in as_completed(futures):
+        i, arrbytes = fut.result()
+        imgOut[i] = np.frombuffer(arrbytes, dtype=np.single)
+
+        if outputCounter > 50:
+            plt.clf()
+            plt.imshow(imgOut, cmap=plt.get_cmap('terrain'))
+            plt.colorbar()
+            plt.tight_layout()                                # DEBUG
+            plt.savefig(outputDir + 'out-color.png')
+            outputCounter = 0
+        outputCounter += 1
 
 plt.clf()
 plt.imshow(imgOut, cmap=plt.get_cmap('terrain'))
